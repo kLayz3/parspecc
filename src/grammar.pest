@@ -1,0 +1,146 @@
+// --------------------------- 
+// Basic lexer rules: 
+// --------------------------- 
+COMMENT = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" } // Redundant; will get stripped by the C-preproc
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+SEMICOLON = _{ ";" }
+
+HEX = @{ "0x" ~ ASCII_HEX_DIGIT+ }
+DEC = @{ ASCII_DIGIT  ~ !("x" | "b") ~ ASCII_DIGIT* }
+BIN = @{ "0b" ~ ASCII_BIN_DIGIT+ }
+NUM = { DEC | HEX | BIN | RUST }  // Ordering in this rule is important!
+
+// Normal identifier. Starting with underscore prohibited!
+IDENT = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* } 
+
+// Used for templating:
+IDENT_LIST = { (IDENT ~ ",")* ~ IDENT }
+
+// Array items
+ARRAY = { IDENT ~ ( "[" ~ NUM|VAR ~ "]" )+ }
+
+// Variables, which can be scoped with access operator `.`
+VAR = ${ (IDENT ~ ".")* ~ IDENT }
+
+// Raw block. Will get literally pasted after the parsing. No scoping gets checked.
+//RAW = { "raw!" ~ "{" ~ EXPR_BLOCK ~ "}" }
+RAW = { "raw!" ~ "(" ~ EXPR_BLOCK ~ ")" }
+
+
+// Rust expression. Must return a number. 
+// Gets evaluated first. Must return an integer. Everything in its scope is opaque.
+RUST = { "rust!" ~ "(" ~ EXPR_BLOCK ~ ")" ~ SEMICOLON }
+
+// Values can be either variables, literal number or raw block
+VAL = { NUM | RAW | VAR }
+
+// Compile-time values, either a literal or a identifier matching template parameter.
+STATIC_VAL = { NUM | IDENT }
+
+// Recursive rules to handle bracket balancing.
+EXPR_BLOCK = { _BALANCED_PARENS }
+_BALANCED_PARENS = _{ (_PARENS | _INNER)* }
+_PARENS = _{ "(" ~ _BALANCED_PARENS ~ ")" }
+_INNER = _{ ( !"(" ~ !")" ~ ANY )+ }
+
+// MEMBER declaration types
+D64 = { "DATA64" | "D64" }
+D32 = { "DATA32" | "D32" }
+D16 = { "DATA16" | "D16" }
+MEMBER_TYPE = { D16 | D32 | D64 }
+
+// Primitive field declaration types
+U64 = @{ "UINT64" | "U64" }
+U32 = @{ "UINT32" | "U32" | ("UINT" ~ !ASCII_ALPHANUMERIC ) }
+U16 = @{ "UINT16" | "U16" }
+
+// Fields can be basic: UINT basic
+//    -||--   compound: compound = COMPOUND(g1=val1, g2=val2, ...)
+FIELD_TYPE_BASIC = { U16 | U32 | U64 }
+FIELD_TYPE_COMPOUND = { "IDENT" ~ "(" ~ (IDENT ~ "=" ~ VAL )* ~ ")" } 
+
+/* Rule for struct members declarations. */
+MEMBER = { "MEMBER" ~ "(" ~ MEMBER_TYPE ~ IDENT ~ ( "[" ~ NUM ~ "]" )? ~ ")" ~ ( SEMICOLON )+ }
+
+/* Rule for ENCODE statement. */
+ENCODE = { "ENCODE" ~ "(" ~ ENCODE_IDENT ~ "," ~ "(" ~ "value" ~ "=" ~ VAL ~ ")" ~ ")" ~ ( SEMICOLON )+ }
+ENCODE_IDENT = ${ IDENT ~ ( APPEND_LIST )? }
+APPEND_LIST = @{ WHITESPACE+ ~ "APPEND_LIST" }
+
+/* Inside a field's block can sit either slices or encode's */
+FIELD_BLOCK = { "{" ~ ( SLICE | ENCODE )* ~ "}" }
+
+/* Slices inside the field blocks can be of three varieties:
+   0..5 => value;            /* Will match it. */
+   0..5 => placeholder;      /* Placeholder. */
+   0..5 => ident = MATCH(x); /* Named match. `x` can be a variable */
+   10   => value;            /* Will match the bit. */
+   10   => placeholder;      /* Placeholder bit. */
+   10   => ident = MATCH(x); /* Named match. `x` can be a variable */
+*/
+
+SLICE = { SLICE_RANGE ~ "=>" ~ SLICE_RHS ~ ( SEMICOLON )+ }
+SLICE_RANGE = { NUM ~ ( ".." ~ NUM )? }
+SLICE_RHS = { NUM | SLICE_PLACEHOLDER }
+SLICE_PLACEHOLDER = { IDENT ~ ( "=" ~ MATCH )? }
+MATCH = { "MATCH" ~ "(" ~ VAL ~ ")" }
+
+/* Primitive struct field, say:
+ * UINT b; Serves to just match N bits (N = 16,32,64) */
+BASIC_NAME = ${ FIELD_TYPE_BASIC ~ ( WHITESPACE )+ ~ IDENT }
+BASIC = { BASIC_NAME ~ ( FIELD_BLOCK | SEMICOLON ) ~ ( SEMICOLON )* }
+
+/* Composite struct member, say:
+ * comp = COMPOSITE(); where `COMPOSITE()` is defined somewhere above or #include'd */
+COMPOUND = { IDENT ~ "=" ~  FIELD_TYPE_COMPOUND ~ ( SEMICOLON )+ }
+
+/* Run-time for loop; analog to UCESB `list(x <= i < y)` */
+FOR = { "for" ~ "(" ~ NUM ~ "<=" ~ IDENT ~ "<" ~ NUM ~ ")"  ~ "{"
+	~ ( BASIC | COMPOUND | ENCODE | FOR | DYN )*  ~ "}" ~ ( SEMICOLON )* }
+
+// A block can be tagged with `dyn!` to greedily keep matching any amount of times.
+DYN = { "dyn!" ~ ( "[" ~ "max" ~ "=" ~ NUM ~  "]" )? ~ 
+	   "{" ~ ( BASIC | COMPOUND | ENCODE | FOR | DYN )+  ~ "}" ~ ( SEMICOLON )* }
+
+// ---------------------------
+// Parser rules: 
+// ---------------------------
+
+struct = {
+
+	/* Struct def: */
+	IDENT ~ "(" ~
+	( IDENT_LIST )? ~
+	")" ~ "{" ~
+	
+	/* The meat inside the struct: */
+	( MEMBER | BASIC | COMPOUND | ENCODE | FOR | DYN )* ~
+
+	"}" ~ ( SEMICOLON )*
+}
+
+subevent = {
+	"SUBEVENT" ~ "(" ~
+	IDENT ~
+	")" ~ "{" ~
+
+	// ... stuff 
+
+	"}" ~ ( SEMICOLON )*
+}
+
+event = {
+	"EVENT" ~ 
+	( "[" ~ "trig_type" ~ "=" ~ NUM ~ "]" )? ~
+	"{" ~	
+	
+	// ... stuff
+
+	"}" ~ ( SEMICOLON )*
+}
+
+file = {
+	SOI ~
+	( subevent | event | struct )* ~
+	EOI 
+}
